@@ -1,0 +1,315 @@
+#!/usr/bin/env python3
+"""netmon viewer — read the JSONL written by the netmon OpenCode plugin."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
+
+def default_path() -> Path:
+    override = os.environ.get("NETMON_FILE")
+    if override:
+        return Path(override).expanduser()
+    if os.name == "nt":
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            return Path(appdata) / "opencode" / "netmon" / "traffic.jsonl"
+    xdg = os.environ.get("XDG_DATA_HOME")
+    if xdg and os.path.isabs(xdg):
+        return Path(xdg) / "opencode" / "netmon" / "traffic.jsonl"
+    return Path.home() / ".local" / "share" / "opencode" / "netmon" / "traffic.jsonl"
+
+
+DEFAULT = default_path()
+
+RESET = "\033[0m"
+DIM = "\033[2m"
+RED = "\033[31m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+CYAN = "\033[36m"
+
+
+def color(text: str, code: str, enabled: bool) -> str:
+    return f"{code}{text}{RESET}" if enabled else text
+
+
+def human_bytes(value: float) -> str:
+    if not value or value <= 0:
+        return "0 B"
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024
+    return f"{value:.1f} GB"
+
+
+def human_ms(value: float) -> str:
+    if not value or value <= 0:
+        return "-"
+    if value < 1000:
+        return f"{value:.0f}ms"
+    return f"{value / 1000:.2f}s"
+
+
+def read_records(path: Path, limit: int | None = None) -> list[dict]:
+    if not path.exists():
+        return []
+    records: list[dict] = []
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except OSError as error:
+        print(f"netmon: cannot read {path}: {error}", file=sys.stderr)
+        return []
+    if limit is not None:
+        return records[-limit:]
+    return records
+
+
+def status_color(status: int, text: str, enabled: bool) -> str:
+    if status >= 500:
+        return color(text, RED, enabled)
+    if status >= 400:
+        return color(text, YELLOW, enabled)
+    if status >= 200:
+        return color(text, GREEN, enabled)
+    return text
+
+
+def row(record: dict, use_color: bool) -> str:
+    ts = str(record.get("ts", ""))
+    clock = ts[11:19] if len(ts) >= 19 else ts
+    kind = str(record.get("kind", ""))
+    model = f"{record.get('provider', '?')}/{record.get('model', '?')}"
+    if record.get("type") == "retry":
+        error = record.get("error") or {}
+        return (
+            f"{clock}  {'retry':<6}  {kind:<8}  {model:<26}  "
+            f"#{record.get('attempt', '?')} {error.get('type', '')} "
+            f"{(error.get('message') or '')[:60]}"
+        )
+    if record.get("type") == "ws":
+        phase = record.get("phase", "ws")
+        return (
+            f"{clock}  {'ws':<6}  {kind:<8}  {model:<26}  {phase:<5}  "
+            f"{record.get('framesIn', 0)}↓/{record.get('framesOut', 0)}↑  "
+            f"↑{human_bytes(record.get('bytesOut', 0))} ↓{human_bytes(record.get('bytesIn', 0))}"
+        )
+    status = int(record.get("status") or 0)
+    status_text = status_color(status, f"{status:<6}", use_color)
+    usage = record.get("tokens") or {}
+    tokens = "-"
+    if usage:
+        tokens = f"{usage.get('input', 0)}/{usage.get('output', 0)}"
+    target = f"{record.get('host', '')}{record.get('path', '')}"
+    line = (
+        f"{clock}  {status_text}  {kind:<8}  {model:<26}  "
+        f"{human_ms(record.get('durationMs', 0)):>7}  "
+        f"↑{human_bytes(record.get('reqBytes', 0)):>9}  "
+        f"↓{human_bytes(record.get('resBytes', 0)):>9}  "
+        f"{tokens:>11}  {target}"
+    )
+    if record.get("error"):
+        line += color(f"  ! {record['error'].get('message', '')[:80]}", RED if status >= 400 else YELLOW, use_color)
+    return line
+
+
+def header() -> str:
+    return (
+        f"{'time':<8}  {'status':<6}  {'kind':<8}  {'provider/model':<26}  "
+        f"{'dur':>7}  {'up':>10}  {'down':>10}  {'in/out':>11}  host/path"
+    )
+
+
+def print_rows(records: list[dict], use_color: bool, show_header: bool = True) -> None:
+    if show_header:
+        print(color(header(), DIM, use_color))
+    for record in records:
+        print(row(record, use_color))
+
+
+def stats(records: list[dict], use_color: bool) -> None:
+    requests = [r for r in records if r.get("type") == "request"]
+    retries = [r for r in records if r.get("type") == "retry"]
+    sockets = [r for r in records if r.get("type") == "ws"]
+    if not requests and not retries and not sockets:
+        print("netmon: no traffic recorded")
+        return
+
+    up = sum(int(r.get("reqBytes") or 0) for r in requests) + sum(
+        int(r.get("bytesOut") or 0) for r in sockets
+    )
+    down = sum(int(r.get("resBytes") or 0) for r in requests) + sum(
+        int(r.get("bytesIn") or 0) for r in sockets
+    )
+    tokens_in = sum(int((r.get("tokens") or {}).get("input") or 0) for r in requests + sockets)
+    tokens_out = sum(int((r.get("tokens") or {}).get("output") or 0) for r in requests + sockets)
+    cache = sum(int((r.get("tokens") or {}).get("cacheRead") or 0) for r in requests)
+    errors = sum(1 for r in requests if r.get("error"))
+    total_ms = sum(float(r.get("durationMs") or 0) for r in requests)
+
+    print(color(f"netmon — {len(requests)} HTTP requests, {len(sockets)} WS events, {len(retries)} retries, {errors} errors", CYAN, use_color))
+    print(f"  bytes      ↑ {human_bytes(up)}   ↓ {human_bytes(down)}")
+    print(f"  tokens     in {tokens_in} / out {tokens_out} / cache reuse {cache}")
+    if requests:
+        print(f"  latency    avg {human_ms(total_ms / len(requests))}")
+    statuses: dict[str, int] = defaultdict(int)
+    for record in requests:
+        statuses[str(record.get("status") or 0)] += 1
+    print("  status    " + "  ".join(f"{key}:{value}" for key, value in sorted(statuses.items())))
+
+    hosts: dict[str, dict[str, float]] = defaultdict(lambda: {"n": 0, "up": 0, "down": 0, "ms": 0})
+    models: dict[str, dict[str, float]] = defaultdict(lambda: {"n": 0, "tok": 0, "ms": 0})
+    for record in requests:
+        host = record.get("host") or "unknown"
+        entry = hosts[host]
+        entry["n"] += 1
+        entry["up"] += int(record.get("reqBytes") or 0)
+        entry["down"] += int(record.get("resBytes") or 0)
+        entry["ms"] += float(record.get("durationMs") or 0)
+        key = f"{record.get('provider', '?')}/{record.get('model', '?')}"
+        model = models[key]
+        model["n"] += 1
+        usage = record.get("tokens") or {}
+        model["tok"] += int(usage.get("input") or 0) + int(usage.get("output") or 0)
+        model["ms"] += float(record.get("durationMs") or 0)
+
+    print()
+    print(color("hosts", DIM, use_color))
+    for host, entry in sorted(hosts.items(), key=lambda item: -item[1]["n"]):
+        print(
+            f"  {host:<32} {int(entry['n']):>4} req  "
+            f"↑{human_bytes(entry['up']):>9} ↓{human_bytes(entry['down']):>9}  "
+            f"avg {human_ms(entry['ms'] / entry['n'])}"
+        )
+    print()
+    print(color("models", DIM, use_color))
+    for model, entry in sorted(models.items(), key=lambda item: -item[1]["n"]):
+        print(
+            f"  {model:<40} {int(entry['n']):>4} req  "
+            f"{int(entry['tok']):>8} tok  avg {human_ms(entry['ms'] / entry['n'])}"
+        )
+
+
+def follow(path: Path, use_color: bool, backfill: int) -> None:
+    print(color(f"netmon — following {path} (Ctrl+C to stop)", DIM, use_color))
+    existing = read_records(path, backfill)
+    if existing:
+        print_rows(existing, use_color)
+    position = path.stat().st_size if path.exists() else 0
+    print(color(header(), DIM, use_color))
+    while True:
+        try:
+            if not path.exists():
+                time.sleep(0.5)
+                continue
+            size = path.stat().st_size
+            if size < position:
+                position = 0
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                handle.seek(position)
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    print(row(record, use_color), flush=True)
+                position = handle.tell()
+        except KeyboardInterrupt:
+            print()
+            return
+        except OSError:
+            pass
+        time.sleep(0.5)
+
+
+def enable_windows_ansi() -> None:
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)
+        mode = ctypes.c_uint32()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+    except Exception:
+        pass
+
+
+def main() -> int:
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):
+        pass
+    enable_windows_ansi()
+    parser = argparse.ArgumentParser(description="View OpenCode netmon traffic")
+    parser.add_argument("-f", "--follow", action="store_true", help="follow the log live")
+    parser.add_argument("-n", "--lines", type=int, default=None, help="recent records to show (default 20, stats: all)")
+    parser.add_argument("--stats", action="store_true", help="aggregate statistics")
+    parser.add_argument("--json", action="store_true", help="print raw JSON records")
+    parser.add_argument("--clear", action="store_true", help="truncate the traffic log")
+    parser.add_argument("--file", type=Path, default=DEFAULT, help=f"log file (default {DEFAULT})")
+    parser.add_argument("--no-color", action="store_true", help="disable colors")
+    args = parser.parse_args()
+
+    use_color = sys.stdout.isatty() and not args.no_color
+
+    if args.clear:
+        try:
+            args.file.write_text("", encoding="utf-8")
+        except OSError as error:
+            print(f"netmon: cannot clear {args.file}: {error}", file=sys.stderr)
+            return 1
+        print(f"netmon: cleared {args.file}")
+        return 0
+
+    if args.follow:
+        follow(args.file, use_color, args.lines or 20)
+        return 0
+
+    records = read_records(args.file, args.lines if args.lines is not None else (None if args.stats else 20))
+    if args.json:
+        print(json.dumps(records, indent=2))
+        return 0
+    if not records:
+        print(f"netmon: no records in {args.file}")
+        print("netmon: traffic appears after the netmon plugin is loaded and a model request runs")
+        return 0
+    if args.stats:
+        stats(records, use_color)
+        return 0
+    print(color(header(), DIM, use_color))
+    print_rows(records, use_color, show_header=False)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(130) from None
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        except OSError:
+            pass
+        raise SystemExit(0) from None
